@@ -239,7 +239,7 @@ const G = {
   score: 0, multi: 1, bounces: 0, lastH: 0, topH: 0, best: 0, left: GAME_LENGTH, timer: 0, time: 0,
   verdict: '', status: '', cheer: 0, bonked: false,
 };
-const bird = { state: 'gone', x: 0, y: 0, z: BIRD_Z, vx: 0, vy: 0, vz: 0, yaw: 0, spin: 0, t: 0, from: null };
+const bird = { phase: 0, to: null, state: 'gone', x: 0, y: 0, z: BIRD_Z, vx: 0, vy: 0, vz: 0, yaw: 0, spin: 0, t: 0, from: null };
 const feathers = [];
 try { G.best = Number(localStorage.getItem(BEST_KEY)) || 0; } catch (e) { /* private window: no saved best */ }
 
@@ -397,16 +397,21 @@ function bonk() {
   sound('bonk');
 }
 function birdFloor(x, y) { return surfaceAt(x, y, G.sink); }
+const ORBIT_SPIN = .45, JOIN_AT = Math.PI / 4, ENTRY_RUN = 20;
 function orbitAt(time) {
-  const a = time * .45;
+  const a = time * ORBIT_SPIN + bird.phase;
   return { x: Math.cos(a) * BIRD_ORBIT, y: Math.sin(a) * BIRD_ORBIT, z: BIRD_Z + Math.sin(time * 1.7) * .12, yaw: a + Math.PI / 2 };
 }
 // the pigeon flies back to its circle from wherever it is: off screen, the lawn, or halfway out
+// it joins the circle at the front, where the circle runs right to left across the screen,
+// so an entry from the right edge flows straight into it without a turn
 function arrive() {
+  bird.phase = JOIN_AT - (G.time + ARRIVE_T) * ORBIT_SPIN;
+  const to = orbitAt(G.time + ARRIVE_T), heading = [Math.cos(to.yaw), Math.sin(to.yaw)];
   if (bird.state === 'gone') {
-    const side = Math.random() < .5 ? -1 : 1;
-    Object.assign(bird, { x: side < 0 ? -16 : 12, y: side < 0 ? 12 : -16, z: 17 });
+    Object.assign(bird, { x: to.x - heading[0] * ENTRY_RUN, y: to.y - heading[1] * ENTRY_RUN, z: to.z + 2.2, yaw: to.yaw });
   }
+  bird.to = to;
   bird.from = { x: bird.x, y: bird.y, z: bird.z + (bird.state === 'dazed' ? .3 : 0) };
   Object.assign(bird, { state: 'arrive', t: 0, spin: 0 });
 }
@@ -418,12 +423,17 @@ function updateBird(dt) {
     Object.assign(bird, { x: o.x, y: o.y, z: o.z });
     bird.yaw = turnTowards(bird.yaw, o.yaw, Math.min(1, dt * 5));
   } else if (bird.state === 'arrive') {
-    // ease into the moving circle, with a swoop that lifts in the middle of the flight
-    const e = ease(clamp(bird.t / ARRIVE_T, 0, 1)), o = orbitAt(G.time), x0 = bird.x, y0 = bird.y;
+    // glide in fast and slow down to circling speed right where the circle picks up, with a gentle swoop
+    const t = clamp(bird.t / ARRIVE_T, 0, 1), o = bird.to, x0 = bird.x, y0 = bird.y;
+    const run = Math.hypot(o.x - bird.from.x, o.y - bird.from.y, o.z - bird.from.z) || 1;
+    const endSpeed = ORBIT_SPIN * BIRD_ORBIT * ARRIVE_T / run, startSpeed = 1.6;
+    const e = (t * t * t - 2 * t * t + t) * startSpeed + (3 * t * t - 2 * t * t * t) + (t * t * t - t * t) * endSpeed;
     bird.x = lerp(bird.from.x, o.x, e);
     bird.y = lerp(bird.from.y, o.y, e);
     bird.z = lerp(bird.from.z, o.z, e) + Math.sin(Math.PI * e) * 1.5;
-    if (Math.hypot(bird.x - x0, bird.y - y0) > 1e-4) bird.yaw = turnTowards(bird.yaw, Math.atan2(bird.y - y0, bird.x - x0), Math.min(1, dt * 8));
+    // face where it is going, then bank into the circle's direction over the second half
+    if (t > .5) bird.yaw = turnTowards(bird.yaw, o.yaw, Math.min(1, dt * 3));
+    else if (Math.hypot(bird.x - x0, bird.y - y0) > 1e-4) bird.yaw = turnTowards(bird.yaw, Math.atan2(bird.y - y0, bird.x - x0), Math.min(1, dt * 8));
     if (bird.t >= ARRIVE_T) { bird.state = 'fly'; sound('coo'); }
   } else if (bird.state === 'fall') {
     bird.vz -= GRAVITY * .6 * dt;
