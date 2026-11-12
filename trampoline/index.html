@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Trampoline</title>
+<style>
+  :root { --ink: #1c1b19; --muted: #8b877f; --paper: #fff; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--paper); color: var(--ink); }
+  body { font: 13px/1.35 ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { display: block; image-rendering: pixelated; touch-action: none; cursor: pointer; outline: none; }
+  .hud { position: fixed; left: max(16px, env(safe-area-inset-left)); right: max(16px, env(safe-area-inset-right)); display: flex; justify-content: space-between; gap: 16px; pointer-events: none; }
+  #scores { position: fixed; top: max(14px, env(safe-area-inset-top)); left: max(16px, env(safe-area-inset-left)); display: grid; gap: 2px; pointer-events: none; }
+  #scores b { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #scores span { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #bottom { bottom: max(14px, env(safe-area-inset-bottom)); align-items: flex-end; }
+  #status { color: var(--muted); }
+  button { pointer-events: auto; font: inherit; color: var(--muted); background: none; border: 0; padding: 10px; margin: -10px; cursor: pointer; }
+  button:hover, button:focus-visible { color: var(--ink); }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" tabindex="0" aria-label="Backyard trampoline. Hold as you come down to push into the mat, let go on the way up to bounce higher."></canvas></div>
+<div id="scores"><b id="score">0</b><span id="meta"></span></div>
+<div class="hud" id="bottom">
+  <div id="status" role="status" aria-live="polite"></div>
+  <button id="mute" type="button" aria-pressed="false">sound on</button>
+</div>
+<script src="../shell.js"></script>
+<script>
+PixelPlays.mount({
+  id: 'trampoline',
+  rules: [
+    'Hold as you come down to push into the mat. Let go on the way up. Use a finger, the mouse or space.',
+    'Every well-timed push stores more spring, so each bounce goes higher. Hold on the way up and the mat swallows your bounce.',
+    'Each bounce scores its height. A clean bounce, pushed down and released up, raises the multiplier up to x5. A dead bounce resets it.',
+    'You have 45 seconds.',
+  ],
+});
+</script>
+<script>window.PP_SCENE = { originY: 50, shadowX: .9, shadowY: -.35 };</script>
+<script src="../engine.js"></script>
+<script>
+'use strict';
+
+const MAT_Z = 1, MAT_R = 3, PAD_OUT = 3.7, PAD_Z = 1.08, LEG_R = 3.5;
+// the mat is a spring under the jumper's feet. Holding on the way down pushes it deeper (stores energy),
+// holding on the way up fights it (loses energy). Tuned so clean timing climbs to ~12 in half a minute
+const GRAVITY = 12, SPRING = 70, PUMP = 16, FIGHT = 20, BOUNCE_KEEP = .93, AIR_DRAG = .004, GRACE = .08, MIN_HOP = .6;
+const SETTLE = 8, SUBSTEP = 1 / 240, VISUAL_SINK = .36, MAX_SINK = .9;
+const GAME_LENGTH = 45, MAX_MULTI = 5, METERS = .6, CHEER_AT = 8.5, SPIN_AT = 7;
+const BEST_KEY = 'pixel-plays:trampoline:best';
+const LIGHT_X = -SHADOW_X / Math.hypot(SHADOW_X, SHADOW_Y), LIGHT_Y = -SHADOW_Y / Math.hypot(SHADOW_X, SHADOW_Y);
+
+const MAT = [56, 58, 70], MAT_MARK = [214, 210, 196], PAD = [58, 118, 196], STEEL = [150, 156, 164];
+const PICKET = [184, 146, 104], SOIL = [116, 88, 66], SLAB_TONES = [[196, 186, 168], [204, 194, 176], [210, 200, 182]];
+const POOL_RING = [236, 116, 104], POOL_WATER = [120, 194, 222];
+const FLOWERS = [[238, 120, 150], [248, 214, 92], [250, 246, 230], [196, 120, 210]];
+const KID = { shirt: [214, 62, 74], stripe: [246, 238, 220], legs: [58, 72, 128], skin: [230, 180, 140], hair: [120, 74, 40] };
+const PARENT = { shirt: [236, 196, 82], stripe: [236, 196, 82], legs: [84, 92, 108], skin: [176, 120, 90], hair: [44, 34, 30] };
+const PARENT_AT = [5.8, 1.6], TREE_AT = [-7.8, 4.8], POOL_AT = [-1.6, 6.8];
+const KIND_STONE = 1, KIND_SOIL = 2;
+// easter egg: a pigeon circles just above what a near-perfect bounce can reach
+const BIRD_REACH = 11.2, HEAD_TOP = 2.4, BIRD_Z = MAT_Z + BIRD_REACH + HEAD_TOP + .2, BIRD_ORBIT = 1.4, BONK_BONUS = 500;
+const PIGEON = [132, 136, 156], PIGEON_HEAD = [92, 102, 126], PIGEON_WING = [104, 108, 128], PIGEON_TAIL = [70, 72, 88], BEAK = [236, 170, 60];
+const padMask = new Uint8Array(W * H), frameZ = new Float32Array(W * H);
+
+/* ---------- scenery ---------- */
+function groundColor(x, y, ix, iy, i) {
+  const edge = Math.pow(Math.pow(Math.abs(x) / 9.7, 8) + Math.pow(Math.abs(y) / 9.7, 8), .125);
+  const rough = edge + (noise(x * 1.3, y * 1.3) - .5) * .08;
+  if (rough > 1.04) return 0;
+  if (rough > .95 && hash(ix, iy) < (rough - .95) / .09) return 0;
+  const fine = hash(ix, iy);
+  if (x < -8 || y < -8) {
+    kinds[i] = KIND_SOIL;
+    return rampOf(SOIL)[clamp(Math.floor(1.6 + noise(x * 3, y * 3) * 1.8 + (bayerAt(ix, iy) - .5) * .9), 1, 4)];
+  }
+  if (x > 4.3 && x < 8.7 && y > -1.7 && y < 4.5) {
+    kinds[i] = KIND_STONE;
+    const gx = Math.abs((x - 4.3) / 1.1 - Math.round((x - 4.3) / 1.1)), gy = Math.abs((y + 1.7) / 1.03 - Math.round((y + 1.7) / 1.03));
+    if (gx < .03 || gy < .03) return rgb(156, 148, 136);
+    const slab = hash(Math.floor((x - 4.3) / 1.1), Math.floor((y + 1.7) / 1.03));
+    return rgb(...SLAB_TONES[clamp(Math.floor(slab * 3 + (noise(x * 2, y * 2) - .5) * .8 + (bayerAt(ix, iy) - .5) * .5), 0, 2)]);
+  }
+  kinds[i] = KIND_GRASS;
+  // mowing stripes run along x; adjacent stripes are one tone apart so the dither stays soft
+  const stripe = Math.floor((x + 40) / 1.7) % 2 ? .22 : 0;
+  const t = noise(x * .9, y * .9) * .9 + (fine - .5) * .5 + stripe;
+  return rgb(...GRASS[clamp(Math.floor(t * 3.2 + .4), 0, 3)]);
+}
+function bakePaint(x, y, z, color, mask) {
+  const p = project(x, y, z), ix = p.sx | 0, iy = p.sy | 0;
+  if (ix < 0 || iy < 0 || ix >= W || iy >= H) return;
+  const i = iy * W + ix;
+  if (p.d <= zb[i]) return;
+  zb[i] = p.d;
+  pix[i] = color;
+  padMask[i] = mask ? 1 : 0;
+}
+function bakeTrampoline() {
+  const pad = rampOf(PAD);
+  const pick = (ramp, level, ix, iy) => ramp[clamp(Math.floor(level + (bayerAt(ix, iy) - .5) * .6), 0, 4)];
+  for (let k = 0; k < 6; k++) {
+    const a = (k + .5) / 6 * 6.283, x = Math.cos(a) * LEG_R, y = Math.sin(a) * LEG_R;
+    capsule([x, y, PAD_Z - .2], [x * 1.04, y * 1.04, 0], .07, .07, () => STEEL, 'solid');
+    for (let z = 0; z < 1; z += .25) castShadow(x * 1.04, y * 1.04, z, .1);
+  }
+  // padded frame: a soft rounded top over the springs, and a side wall that faces the light or not
+  for (let r = MAT_R; r <= PAD_OUT; r += .03) {
+    const n = Math.ceil(6.283 * r / .03), z = PAD_Z - .04 + .07 * Math.sin(Math.PI * (r - MAT_R) / (PAD_OUT - MAT_R));
+    for (let k = 0; k < n; k++) {
+      const a = k / n * 6.283, ca = Math.cos(a), sa = Math.sin(a), p = project(r * ca, r * sa, z);
+      const roll = (r - MAT_R) / (PAD_OUT - MAT_R) - .5;
+      const level = 3.1 + roll * (ca * LIGHT_X + sa * LIGHT_Y) * 1.6 + (noise(a * 8, r * 4) - .5) * .4;
+      bakePaint(r * ca, r * sa, z, pick(pad, level, p.sx | 0, p.sy | 0), true);
+    }
+  }
+  const n = Math.ceil(6.283 * PAD_OUT / .03);
+  for (let k = 0; k < n; k++) {
+    const a = k / n * 6.283, ca = Math.cos(a), sa = Math.sin(a), x = PAD_OUT * ca, y = PAD_OUT * sa;
+    const seam = Math.abs(a / 6.283 * 12 - Math.round(a / 6.283 * 12)) < .02;
+    for (let z = PAD_Z - .3; z <= PAD_Z; z += .03) {
+      const p = project(x, y, z);
+      bakePaint(x, y, z, pick(pad, 1.9 + (ca * LIGHT_X + sa * LIGHT_Y) * 1.1 - (seam ? .8 : 0), p.sx | 0, p.sy | 0), false);
+    }
+  }
+  // the mat and pad throw one big shadow on the lawn underneath
+  for (let x = -PAD_OUT; x <= PAD_OUT; x += .3) for (let y = -PAD_OUT; y <= PAD_OUT; y += .3) {
+    if (Math.hypot(x, y) < PAD_OUT - .1) castShadow(x, y, MAT_Z, .34, 1, .4);
+  }
+}
+function picket(x0, y0, x1, y1) {
+  box(x0, y0, 0, x1, y1, 1.15, PICKET, x0 * 3 + y0);
+  castShadow((x0 + x1) / 2, (y0 + y1) / 2, .6, .14, 1, .2);
+}
+function bakeFence() {
+  for (let t = -9.15; t < 8.8; t += .42) {
+    picket(-9.15, t, -9, t + .24);
+    picket(t, -9.15, t + .24, -9);
+  }
+  box(-9.32, -9.3, .3, -9.18, 8.9, .44, PICKET, 3);
+  box(-9.3, -9.32, .3, 8.9, -9.18, .44, PICKET, 5);
+  box(-9.32, -9.3, .82, -9.18, 8.9, .96, PICKET, 4);
+  box(-9.3, -9.32, .82, 8.9, -9.18, .96, PICKET, 6);
+  for (let k = 0; k < 46; k++) {
+    const along = -8.4 + hash(k, 1) * 16.8, across = -8.75 + hash(k, 2) * .6, x = k % 2 ? across : along, y = k % 2 ? along : across;
+    if (k % 5 === 0) {
+      sphere(x, y, .32, .34, [70, 112, 66], 'rough');
+      castShadow(x, y, .3, .32);
+    } else {
+      capsule([x, y, 0], [x, y, .32], .03, .03, () => [76, 116, 60], 'solid');
+      sphere(x, y, .38, .12, FLOWERS[k % FLOWERS.length], 'solid');
+    }
+  }
+}
+function bakePool() {
+  const [px, py] = POOL_AT, water = rampOf(POOL_WATER);
+  for (let r = 0; r < 1.2; r += .03) {
+    const n = Math.max(1, Math.ceil(6.283 * r / .03));
+    for (let k = 0; k < n; k++) {
+      const a = k / n * 6.283, x = px + r * Math.cos(a), y = py + r * Math.sin(a), p = project(x, y, .22);
+      const glint = hash(p.sx | 0, p.sy | 0) > .97 ? 1 : 0;
+      bakePaint(x, y, .22, water[clamp(Math.floor(2.6 + glint + (noise(x * 2, y * 2) - .5) * .7 + (bayerAt(p.sx | 0, p.sy | 0) - .5) * .5), 0, 4)], false);
+    }
+  }
+  for (let k = 0; k < 40; k++) {
+    const a = k / 40 * 6.283, x = px + Math.cos(a) * 1.4, y = py + Math.sin(a) * 1.4;
+    sphere(x, y, .26, .27, Math.floor(k / 5) % 2 ? POOL_RING : [244, 240, 228], 'solid');
+    castShadow(x, y, .25, .28);
+  }
+}
+function bake() {
+  zb.fill(-1e9);
+  pix.fill(rgb(255, 255, 255));
+  for (let iy = 0; iy < H; iy++) for (let ix = 0; ix < W; ix++) {
+    const g = unproject(ix + .5, iy + .5), i = iy * W + ix, c = groundColor(g.x, g.y, ix, iy, i);
+    if (!c) continue;
+    pix[i] = c; ground[i] = 1;
+    zb[i] = (g.x + g.y) / R2 * COS;
+  }
+  growGrass();
+  groundZ.set(zb);
+  bakeFence();
+  growTree(TREE_AT[0], TREE_AT[1], .95, 380, 11);
+  bakePool();
+  bakeTrampoline();
+  const cooler = [PARENT_AT[0] + 1.3, PARENT_AT[1] + 1.4];
+  box(cooler[0] - .35, cooler[1] - .25, 0, cooler[0] + .35, cooler[1] + .25, .5, [64, 132, 168], 2);
+  box(cooler[0] - .37, cooler[1] - .27, .5, cooler[0] + .37, cooler[1] + .27, .58, [236, 232, 220], 8);
+  castShadow(cooler[0], cooler[1], .3, .45);
+  bakeOcclusion();
+  staticShadow.set(shadowMask);
+  applyShadows(groundZ);
+  // from here the pad takes moving shadows like the ground does
+  for (let i = 0; i < W * H; i++) if (padMask[i]) ground[i] = 1;
+  bakedPix.set(pix);
+  bakedZ.set(zb);
+}
+
+/* ---------- the mat ---------- */
+// depth of the dip under the feet, falling off to nothing at the springs
+function matProfile(r) {
+  const p = clamp(1 - (r - .25) / (MAT_R - .25), 0, 1);
+  return Math.pow(p, 1.6);
+}
+function surfaceAt(x, y, sink) {
+  const r = Math.hypot(x, y);
+  if (r <= MAT_R) return MAT_Z - sink * matProfile(r);
+  return r <= PAD_OUT ? PAD_Z : 0;
+}
+function paintMat(sink) {
+  const ramp = rampOf(MAT), mark = rampOf(MAT_MARK);
+  for (let r = 0; r <= MAT_R; r += .04) {
+    const n = Math.max(1, Math.ceil(6.283 * r / .04)), z = MAT_Z - sink * matProfile(r);
+    const dzdr = -sink * (matProfile(r + .02) - matProfile(r - .02)) / .04;
+    const ring = Math.abs(r - 1.05) < .07, rim = r > MAT_R - .1;
+    for (let k = 0; k < n; k++) {
+      const a = k / n * 6.283, ca = Math.cos(a), sa = Math.sin(a);
+      const p = project(r * ca, r * sa, z), ix = p.sx | 0, iy = p.sy | 0;
+      if (ix < 0 || iy < 0 || ix >= W || iy >= H) continue;
+      const i = iy * W + ix;
+      if (p.d <= zb[i]) continue;
+      zb[i] = p.d;
+      ground[i] = 1;
+      // the side of the dip that faces the light brightens, the other side darkens
+      const level = 2.4 - dzdr * (ca * LIGHT_X + sa * LIGHT_Y) * 2.6 - (rim ? .9 : 0) + (hash(ix >> 1, iy) - .5) * .3;
+      pix[i] = (ring ? mark : ramp)[clamp(Math.floor(level + (ring ? .4 : 0) + (bayerAt(ix, iy) - .5) * .6), 0, 4)];
+    }
+  }
+}
+
+/* ---------- game state ---------- */
+const G = {
+  phase: 'ready', z: -GRAVITY / SPRING, vz: 0, contact: true, hold: false,
+  downT: 0, upT: 0, downHeld: 0, upHeld: 0, airT: 0, airTotal: 1, spin: false, sink: 0, wobble: 0, wobbleT: 9,
+  score: 0, multi: 1, bounces: 0, lastH: 0, topH: 0, best: 0, left: GAME_LENGTH, timer: 0, time: 0,
+  verdict: '', status: '', cheer: 0, bonked: false,
+};
+const bird = { state: 'fly', x: 0, y: 0, z: BIRD_Z, vx: 0, vy: 0, vz: 0, yaw: 0, spin: 0, t: 0 };
+const feathers = [];
+try { G.best = Number(localStorage.getItem(BEST_KEY)) || 0; } catch (e) { /* private window: no saved best */ }
+
+const nodes = { score: document.getElementById('score'), meta: document.getElementById('meta'), status: document.getElementById('status') };
+function renderHud() {
+  nodes.score.textContent = G.score;
+  nodes.meta.textContent = 'x' + G.multi + ' · ' + Math.ceil(G.left) + 's' + (G.best ? ' · best ' + G.best : '');
+}
+function setStatus(text) {
+  if (text === G.status) return;
+  G.status = text;
+  nodes.status.textContent = text;
+}
+const meters = h => (h * METERS).toFixed(1) + ' m';
+function resetGame() {
+  Object.assign(G, { phase: 'ready', score: 0, multi: 1, bounces: 0, lastH: 0, topH: 0, left: GAME_LENGTH, timer: 0, hold: false, bonked: false });
+  Object.assign(bird, { state: 'fly', t: 0, spin: 0, z: BIRD_Z });
+  feathers.length = 0;
+  setStatus('tap to start bouncing');
+  renderHud();
+}
+function start() {
+  G.phase = 'ride';
+  G.timer = 0;
+  G.contact = false;
+  G.z = 0;
+  G.vz = Math.sqrt(2 * GRAVITY * 1.4);
+  G.airT = 0;
+  G.airTotal = 2 * G.vz / GRAVITY;
+  sound('boing', 1.4);
+}
+function press() {
+  ensureAudio();
+  if (G.phase === 'over') { if (G.timer > .8) resetGame(); return; }
+  if (G.phase === 'ready') { start(); return; }
+  G.hold = true;
+}
+function release() { G.hold = false; }
+
+function landOnMat() {
+  G.contact = true;
+  G.downT = G.upT = G.downHeld = G.upHeld = 0;
+  if (G.phase === 'ride') sound('thump', Math.min(1, -G.vz / 14));
+  if (G.phase === 'ride' && G.left <= 0) finish();
+}
+function takeOff() {
+  G.contact = false;
+  G.airT = 0;
+  G.wobble = Math.min(.3, G.vz * .02);
+  G.wobbleT = 0;
+  if (G.phase !== 'ride') { G.vz *= .45; G.airTotal = 2 * G.vz / GRAVITY; G.spin = false; return; }
+  G.vz *= BOUNCE_KEEP;
+  if (G.vz * G.vz / (2 * GRAVITY) < MIN_HOP) G.vz = Math.sqrt(2 * GRAVITY * MIN_HOP);
+  const h = G.vz * G.vz / (2 * GRAVITY);
+  G.airTotal = 2 * G.vz / GRAVITY;
+  G.spin = h > SPIN_AT;
+  G.bounces++;
+  const pumped = G.downT > 0 && G.downHeld / G.downT > .5;
+  if (G.upHeld > .07) {
+    G.verdict = 'dead';
+    G.multi = 1;
+    sound('dead');
+  } else if (pumped) {
+    G.verdict = 'clean';
+    if (G.multi < MAX_MULTI) { G.multi++; sound('blip'); }
+  } else G.verdict = 'lazy';
+  sound('boing', h);
+  renderHud();
+}
+function apex() {
+  if (G.phase !== 'ride') return;
+  const h = G.z;
+  G.lastH = h;
+  if (h < 1) return;
+  G.topH = Math.max(G.topH, h);
+  const points = Math.round(h * 5) * G.multi;
+  G.score += points;
+  const note = bird.state === 'fall' ? ' · bonk, +' + BONK_BONUS + ' for the pigeon' : G.verdict === 'dead' ? ' · dead bounce, let go on the way up' : G.verdict === 'lazy' && needsHint() ? ' · hold as you come down' : '';
+  setStatus('+' + points + ' · ' + meters(h) + note);
+  if (h > CHEER_AT) G.cheer = 1.4;
+  renderHud();
+}
+function physicsStep(dt) {
+  const live = G.phase === 'ride';
+  if (!G.contact) {
+    const before = G.vz;
+    G.airT += dt;
+    G.vz -= (GRAVITY + AIR_DRAG * G.vz * Math.abs(G.vz)) * dt;
+    G.z += G.vz * dt;
+    if (before > 0 && G.vz <= 0) apex();
+    if (G.z <= 0 && G.vz < 0) landOnMat();
+    return;
+  }
+  let a = -GRAVITY - SPRING * G.z;
+  if (G.vz > 0) G.upT += dt; else G.downT += dt;
+  if (live && G.hold) {
+    if (G.vz <= 0) { a -= PUMP; G.downHeld += dt; }
+    else if (G.upT > GRACE) { a -= FIGHT; G.upHeld += dt; }
+  }
+  if (!live) a -= SETTLE * G.vz;
+  G.vz += a * dt;
+  G.z += G.vz * dt;
+  if (G.z >= 0 && G.vz > 0) takeOff();
+}
+// the hint shows while learning and whenever the bounce has died down
+const needsHint = () => G.bounces < 4 || G.lastH < 2.5;
+function update(dt) {
+  G.time += dt;
+  G.timer += dt;
+  G.cheer = Math.max(0, G.cheer - dt);
+  G.wobbleT += dt;
+  if (G.phase === 'ride') {
+    G.left = Math.max(0, G.left - dt);
+    if (Math.ceil(G.left) !== Math.ceil(G.left + dt)) renderHud();
+  }
+  for (let t = 0; t < dt - 1e-6; t += SUBSTEP) physicsStep(Math.min(SUBSTEP, dt - t));
+  if (G.phase === 'ride' && needsHint() && G.bounces > 0) {
+    if (!G.contact && G.vz < 0 && !G.hold) setStatus('hold as you come down');
+    else if (G.contact && G.vz > 0 && G.hold) setStatus('let go on the way up');
+  }
+  updateBird(dt);
+  if (bird.state === 'fly' && G.phase === 'ride' && !G.contact && MAT_Z + G.z + HEAD_TOP >= bird.z - .2) bonk();
+  G.sink = G.contact ? Math.min(MAX_SINK, Math.max(0, -G.z * VISUAL_SINK)) : G.wobble * Math.sin(G.wobbleT * 24) * Math.exp(-G.wobbleT * 6);
+}
+function finish() {
+  G.phase = 'over';
+  G.timer = 0;
+  G.hold = false;
+  const record = G.score > G.best;
+  if (record) {
+    G.best = G.score;
+    try { localStorage.setItem(BEST_KEY, String(G.best)); } catch (e) { /* private window: keep it for this visit */ }
+  }
+  setStatus(G.score + (record ? ' · new best' : '') + ' · highest ' + meters(G.topH) + (G.bonked ? ' · bonked the pigeon' : '') + ' · tap to bounce again');
+  renderHud();
+}
+
+/* ---------- the pigeon ---------- */
+function bonk() {
+  G.bonked = true;
+  G.score += BONK_BONUS;
+  G.cheer = 2.2;
+  setStatus('bonk · +' + BONK_BONUS + ' · you knocked the pigeon out of the sky');
+  renderHud();
+  // knocked off towards the open lawn at the front
+  const away = .85 + Math.random() * .4;
+  Object.assign(bird, { state: 'fall', t: 0, vx: Math.cos(away) * 1.9, vy: Math.sin(away) * 1.9, vz: 2.5, spin: 0 });
+  for (let k = 0; k < 14; k++) {
+    const a = Math.random() * 6.283, v = .8 + Math.random() * 1.6;
+    feathers.push({
+      x: bird.x, y: bird.y, z: bird.z, vx: Math.cos(a) * v, vy: Math.sin(a) * v, vz: Math.random() * 2,
+      ph: Math.random() * 6.283, landed: false, color: rgb(...(k % 3 ? (k % 3 === 1 ? PIGEON : PIGEON_WING) : [238, 236, 230])),
+    });
+  }
+  sound('bonk');
+}
+function birdFloor(x, y) { return surfaceAt(x, y, G.sink); }
+function updateBird(dt) {
+  bird.t += dt;
+  if (bird.state === 'fly') {
+    const a = G.time * .45;
+    bird.x = Math.cos(a) * BIRD_ORBIT;
+    bird.y = Math.sin(a) * BIRD_ORBIT;
+    bird.z = BIRD_Z + Math.sin(G.time * 1.7) * .12;
+    bird.yaw = a + Math.PI / 2;
+  } else if (bird.state === 'fall') {
+    bird.vz -= GRAVITY * .6 * dt;
+    bird.x = clamp(bird.x + bird.vx * dt, -8, 8);
+    bird.y = clamp(bird.y + bird.vy * dt, -8, 8);
+    bird.z += bird.vz * dt;
+    bird.spin += dt * 9;
+    const floor = birdFloor(bird.x, bird.y);
+    if (bird.z <= floor) {
+      bird.z = floor;
+      Object.assign(bird, { state: 'dazed', t: 0, spin: 0 });
+      sound('thump', .3);
+    }
+  } else if (bird.state === 'dazed') {
+    bird.z = birdFloor(bird.x, bird.y);
+    if (bird.t > 4.5) {
+      Object.assign(bird, { state: 'leave', t: 0, vx: -1.6, vy: -1.2, vz: 3.2, yaw: Math.atan2(-1.2, -1.6) });
+      sound('coo');
+    }
+  } else if (bird.state === 'leave') {
+    bird.x += bird.vx * dt; bird.y += bird.vy * dt; bird.z += bird.vz * dt;
+    if (bird.z > 30) bird.state = 'gone';
+  }
+  for (const f of feathers) {
+    if (f.landed) continue;
+    // feathers drift: they hit terminal speed fast and rock side to side on the way down
+    f.vz += (-2.3 - f.vz) * 2.5 * dt;
+    f.vx *= 1 - 1.5 * dt; f.vy *= 1 - 1.5 * dt;
+    f.x += (f.vx + Math.sin(bird.t * 3 + f.ph) * .6) * dt;
+    f.y += f.vy * dt;
+    f.z += f.vz * dt;
+    const floor = birdFloor(f.x, f.y);
+    if (f.z <= floor) { f.z = floor + .02; f.landed = true; }
+  }
+}
+function drawBird() {
+  if (bird.state === 'gone') return null;
+  const { x, y } = bird, flying = bird.state === 'fly' || bird.state === 'leave', dazed = bird.state === 'dazed';
+  const z = bird.z + (dazed ? .3 : 0), k = 1.6;
+  const yaw = bird.yaw, pitch = bird.spin, cp = Math.cos(pitch), sp = Math.sin(pitch), cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const F = [cy * cp, sy * cp, sp], U = [-cy * sp, -sy * sp, cp], Sd = [-sy, cy, 0];
+  const P = (f, s, u) => [x + (F[0] * f + Sd[0] * s + U[0] * u) * k, y + (F[1] * f + Sd[1] * s + U[1] * u) * k, z + (F[2] * f + Sd[2] * s + U[2] * u) * k];
+  const add = (a, b, r0, r1, c) => dynamicAdd(a, b, r0 * k, r1 * k, () => c);
+  // flap in bursts, glide in between; tumbling wings flail
+  const flapping = bird.state === 'leave' || bird.state === 'fall' || (G.time % 3.2) < 1.3;
+  const wing = bird.state === 'fall' ? Math.sin(bird.t * 22) * 1.1 : flapping ? Math.sin(G.time * 15) * .9 : .15;
+  const bob = dazed ? Math.round(Math.sin(bird.t * 5)) * .04 : 0;
+  add(P(-.22, 0, 0), P(.12, 0, .02), .2, .17, PIGEON);
+  add(P(-.26, 0, .02), P(-.5, 0, .07), .08, .05, PIGEON_TAIL);
+  const head = P(.25, 0, .17 + bob);
+  add(head, head, .13, .13, PIGEON_HEAD);
+  add(P(.35, 0, .15 + bob), P(.44, 0, .12 + bob), .04, .03, BEAK);
+  for (const side of [-1, 1]) {
+    if (flying || bird.state === 'fall') add(P(0, side * .12, .08), P(-.1, side * .62 * Math.cos(wing), .08 + .5 * Math.sin(wing)), .09, .05, PIGEON_WING);
+    else add(P(.02, side * .15, .09), P(-.28, side * .17, .08), .08, .06, PIGEON_WING);
+  }
+  return dazed ? head : null;
+}
+function drawFeathers() {
+  for (const f of feathers) {
+    const p = project(f.x, f.y, f.z), ix = p.sx | 0, iy = p.sy | 0;
+    for (let n = 0; n < 2; n++) {
+      if (ix + n < 0 || iy < 0 || ix + n >= W || iy >= H) continue;
+      const i = iy * W + ix + n;
+      if (p.d <= zb[i]) continue;
+      zb[i] = p.d;
+      pix[i] = f.color;
+    }
+  }
+}
+// three little stars circle a dazed head
+function drawStars(head) {
+  const p = project(...head);
+  for (let k = 0; k < 3; k++) {
+    const a = bird.t * 5 + k * 2.09, sx = Math.round(p.sx + Math.cos(a) * 7), sy = Math.round(p.sy - 7 + Math.sin(a) * 2.5);
+    const star = [[sx, sy], [sx - 1, sy], [sx + 1, sy], [sx, sy - 1], [sx, sy + 1]];
+    drawDots(star, SIGNAL);
+  }
+}
+
+/* ---------- drawing ---------- */
+function jumperPose() {
+  const feet = G.contact ? MAT_Z - G.sink : MAT_Z + G.z;
+  if (G.phase === 'ready' || (G.phase === 'over' && G.contact)) return { z: feet, crouch: G.sink * .5, armR: .1, armL: .08, yaw: 0 };
+  if (G.contact) {
+    const squash = clamp(G.sink / MAX_SINK, 0, 1), down = G.vz <= 0;
+    const arms = down ? (G.hold ? -.35 : .4) : G.hold ? -.2 : 1.6 + squash;
+    return { z: feet, crouch: .15 + squash * .55 + (G.hold ? .2 : 0), armR: arms, armL: arms, yaw: 0 };
+  }
+  const p = clamp(G.airT / G.airTotal, 0, 1), rising = G.vz > 0;
+  const arms = rising ? lerp(2.9, 1.7, p * 2) : G.hold ? .5 : 1.3;
+  // big bounces add a full twist, stepped like the leaves so it reads as pixel animation
+  const yaw = G.spin ? Math.round(ease(clamp((p - .12) / .72, 0, 1)) * 16) / 16 * 6.283 : 0;
+  return { z: feet, crouch: rising ? 0 : G.hold ? .45 : .1, armR: arms, armL: arms, yaw };
+}
+function drawJumper() {
+  const pose = jumperPose();
+  figure(0, 0, Math.PI / 4 + pose.yaw, { z: pose.z, crouch: pose.crouch, stance: .04, armR: pose.armR, armL: pose.armL }, KID, dynamicAdd);
+  return [0, 0, pose.z + 2.3 - pose.crouch * .4];
+}
+function drawParent() {
+  const [x, y] = PARENT_AT, cheering = G.cheer > 0;
+  const yaw = Math.round(Math.atan2(-y, -x) / .4) * .4;
+  const beat = cheering && Math.floor(G.time * 8) % 2;
+  figure(x, y, yaw, { z: 0, scale: 1.05, stance: .1, armR: cheering ? (beat ? 3 : 2.5) : .12, armL: cheering ? (beat ? 2.5 : 3) : .1 }, PARENT, dynamicAdd);
+}
+// a shadow lands on the mat (following its dip), on the pad, or on the lawn
+function stamp(x, y, z, r, strength) {
+  let sz = 0;
+  const h0 = z - MAT_Z;
+  if (h0 > -1 && Math.hypot(x + SHADOW_X * Math.max(0, h0), y + SHADOW_Y * Math.max(0, h0)) <= PAD_OUT) {
+    sz = MAT_Z;
+    for (let k = 0; k < 2; k++) {
+      const h = Math.max(0, z - sz);
+      sz = surfaceAt(x + SHADOW_X * h, y + SHADOW_Y * h, G.sink);
+    }
+  }
+  const h = Math.max(0, z - sz), p = project(x + SHADOW_X * h, y + SHADOW_Y * h, sz);
+  const rx = r * S * 1.05, ry = rx * SIN + 1;
+  const y0 = Math.max(0, Math.floor(p.sy - ry)), y1 = Math.min(H - 1, Math.ceil(p.sy + ry));
+  const x0 = Math.max(0, Math.floor(p.sx - rx)), x1 = Math.min(W - 1, Math.ceil(p.sx + rx));
+  for (let iy = y0; iy <= y1; iy++) for (let ix = x0; ix <= x1; ix++) {
+    const dx = (ix + .5 - p.sx) / rx, dy = (iy + .5 - p.sy) / ry;
+    if (dx * dx + dy * dy > 1) continue;
+    const i = iy * W + ix;
+    if (shadowMask[i] < strength) shadowMask[i] = strength;
+  }
+}
+function flushAllShadows() {
+  for (let i = 0; i < pendingShadows.length; i += 4) {
+    const a = pendingShadows[i], r = pendingShadows[i + 1], b = pendingShadows[i + 2];
+    const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]) / .25));
+    for (let k = 0; k <= n; k++) {
+      const t = k / n;
+      stamp(lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t), r * .9, 1);
+    }
+  }
+  const feet = G.contact ? MAT_Z - G.sink : MAT_Z + G.z;
+  if (feet - surfaceAt(0, 0, G.sink) < .25) stamp(.1, 0, feet, .3, 2);
+}
+const BANG = ['.ooo.', '.oXo.', '.oXo.', '.oXo.', '.ooo.', '.oXo.', '.ooo.'];
+function drawBang(sx, sy) {
+  const ink = [], fill = [];
+  BANG.forEach((row, y) => [...row].forEach((cell, x) => {
+    if (cell === 'o') ink.push([sx - 2 + x, sy + y]);
+    if (cell === 'X') fill.push([sx - 2 + x, sy + y]);
+  }));
+  haloDots(ink);
+  drawDots(ink, INK);
+  drawDots(fill, SIGNAL);
+}
+// a small flag beside the jumper marks the highest bounce of this run
+function drawTopMark() {
+  if (G.topH < 2 || G.phase === 'ready') return;
+  const p = project(0, 0, MAT_Z + G.topH), x = Math.round(p.sx) - 16, y = Math.round(p.sy);
+  const ink = [], fill = [];
+  for (let k = 0; k < 7; k++) { ink.push([x + k, y - 1], [x + k, y + 1]); fill.push([x + k, y]); }
+  ink.push([x - 1, y], [x + 7, y]);
+  haloDots(ink);
+  drawDots(ink, INK);
+  drawDots(fill, SIGNAL);
+}
+function draw() {
+  pix.set(bakedPix);
+  zb.set(bakedZ);
+  paintMat(G.sink);
+  frameZ.set(zb);
+  pendingShadows.length = 0;
+  drawParent();
+  const head = drawJumper();
+  const dazedHead = drawBird();
+  drawFeathers();
+  const windT = STILL ? 0 : Math.floor(G.time * WIND_FPS) / WIND_FPS;
+  drawLeaves(windT);
+  drawTufts(windT);
+  flushAllShadows();
+  applyShadows(frameZ);
+  shadeEdges();
+  drawTopMark();
+  if (dazedHead) drawStars(dazedHead);
+  if (G.phase === 'ride') {
+    const p = project(...head);
+    const fighting = G.contact && G.vz > 0 && G.hold && G.upT > GRACE;
+    if (fighting && Math.floor(G.time * 10) % 2 === 0) drawBang(Math.round(p.sx), Math.round(p.sy) - 16);
+    else if (!G.contact && G.vz < 0 && !G.hold && needsHint()) drawArrow(p.sx, p.sy - 5, G.time);
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+/* ---------- input ---------- */
+canvas.addEventListener('pointerdown', e => {
+  canvas.focus({ preventScroll: true });
+  canvas.setPointerCapture(e.pointerId);
+  press();
+});
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+addEventListener('blur', release);
+canvas.addEventListener('keydown', e => {
+  if (e.key !== ' ' && e.key !== 'Enter') return;
+  e.preventDefault();
+  if (!e.repeat) press();
+});
+canvas.addEventListener('keyup', e => {
+  if (e.key === ' ' || e.key === 'Enter') release();
+});
+
+/* ---------- sound ---------- */
+let audio = null, muted = false, noiseBuffer = null;
+function ensureAudio() {
+  if (audio) { if (audio.state === 'suspended') audio.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  audio = new AC();
+  noiseBuffer = audio.createBuffer(1, audio.sampleRate / 4, audio.sampleRate);
+  const data = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+}
+function burst(at, length, level, freq) {
+  const src = audio.createBufferSource(), gain = audio.createGain(), filter = audio.createBiquadFilter();
+  src.buffer = noiseBuffer;
+  filter.type = 'bandpass'; filter.frequency.value = freq; filter.Q.value = .8;
+  gain.gain.setValueAtTime(level, at);
+  gain.gain.exponentialRampToValueAtTime(.0005, at + length);
+  src.connect(filter).connect(gain).connect(audio.destination);
+  src.start(at); src.stop(at + length + .01);
+}
+function tone(type, from, to, length, level, at) {
+  const osc = audio.createOscillator(), gain = audio.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(from, at);
+  osc.frequency.exponentialRampToValueAtTime(to, at + length);
+  gain.gain.setValueAtTime(level, at);
+  gain.gain.exponentialRampToValueAtTime(.0005, at + length);
+  osc.connect(gain).connect(audio.destination);
+  osc.start(at); osc.stop(at + length + .01);
+  return osc;
+}
+function sound(kind, amount = .6) {
+  if (!audio || muted) return;
+  const now = audio.currentTime;
+  if (kind === 'boing') {
+    // a rising sine with a fast wobble: the springs letting go
+    const osc = tone('sine', 120, 170 + amount * 34, .26, .16, now);
+    const lfo = audio.createOscillator(), depth = audio.createGain();
+    lfo.frequency.value = 19; depth.gain.value = 14;
+    lfo.connect(depth).connect(osc.frequency);
+    lfo.start(now); lfo.stop(now + .28);
+    burst(now, .05, .05, 3400);
+  } else if (kind === 'thump') {
+    tone('triangle', 130, 52, .14, .1 + amount * .22, now);
+  } else if (kind === 'blip') {
+    tone('square', 660 + G.multi * 110, 990 + G.multi * 110, .07, .05, now + .04);
+  } else if (kind === 'bonk') {
+    tone('square', 900, 260, .12, .14, now);
+    burst(now, .08, .12, 1800);
+    // two indignant squawks
+    for (const at of [.12, .3]) tone('sawtooth', 1300, 700, .09, .06, now + at);
+  } else if (kind === 'coo') {
+    for (const at of [0, .22]) tone('sine', 420, 330, .16, .06, now + at);
+  } else if (kind === 'dead') {
+    tone('sawtooth', 110, 62, .2, .1, now);
+  }
+}
+function cheerSound() {
+  if (!audio || muted) return;
+  const now = audio.currentTime;
+  for (let k = 0; k < 9; k++) burst(now + .05 + k * .09 + Math.random() * .05, .05, .04 + Math.random() * .04, 1500 + Math.random() * 1200);
+}
+const muteButton = document.getElementById('mute');
+muteButton.addEventListener('click', () => {
+  muted = !muted;
+  muteButton.textContent = muted ? 'sound off' : 'sound on';
+  muteButton.setAttribute('aria-pressed', String(muted));
+});
+
+/* ---------- boot ---------- */
+addEventListener('resize', fit);
+fit();
+bake();
+resetGame();
+let last = performance.now(), cheered = 0;
+function frame(now) {
+  update(Math.min(.04, (now - last) / 1000));
+  last = now;
+  if (G.cheer > cheered) cheerSound();
+  cheered = G.cheer;
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__tramp = { G, bird, press, release, step(dt, skipDraw) { update(dt); if (!skipDraw) draw(); } };
+</script>
+</body>
+</html>
