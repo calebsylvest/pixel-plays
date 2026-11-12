@@ -9,6 +9,7 @@ window.PixelPlays = (() => {
     { id: 'tie-break', title: 'Tie-Break' },
     { id: 'mini-ramp', title: 'Mini Ramp' },
     { id: 'trampoline', title: 'Trampoline' },
+    { id: 'free-kick', title: 'Free Kick' },
   ];
   const MUSIC_VOLUME = .4;
   const CREDITS = [
