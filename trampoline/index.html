@@ -537,8 +537,14 @@ function drawJumper() {
 function drawParent() {
   const [x, y] = PARENT_AT, cheering = G.cheer > 0;
   const yaw = Math.round(Math.atan2(-y, -x) / .4) * .4;
-  const beat = cheering && Math.floor(G.time * 8) % 2;
-  figure(x, y, yaw, { z: 0, scale: 1.05, stance: .1, armR: cheering ? (beat ? 3 : 2.5) : .12, armL: cheering ? (beat ? 2.5 : 3) : .1 }, PARENT, dynamicAdd);
+  if (!cheering) {
+    figure(x, y, yaw, { z: 0, scale: 1.05, stance: .1, armR: .12, armL: .1 }, PARENT, dynamicAdd);
+    return;
+  }
+  // celebrating: hopping on the spot with both arms thrown up together, punching higher at the top of each hop.
+  // The hop is stepped in whole frames so it reads as pixel animation
+  const phase = Math.floor(G.time * 12) % 6, hop = [0, .14, .26, .3, .26, .14][phase], arms = 2.75 + hop * 1.2;
+  figure(x, y, yaw, { z: hop, scale: 1.05, stance: .1, crouch: phase === 0 ? .25 : 0, armR: arms, armL: arms }, PARENT, dynamicAdd);
 }
 // a shadow lands on the mat (following its dip), on the pad, or on the lawn
 function stamp(x, y, z, r, strength) {
